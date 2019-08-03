@@ -1,37 +1,80 @@
-extern crate regex;
+extern crate getopts;
 extern crate pbr;
+extern crate regex;
 
-use std::{env, process, thread};
+use std::{env, thread};
 use std::net::{TcpStream, IpAddr, Ipv4Addr, Shutdown};
 use std::io::{Write, Read};
 use std::str::from_utf8;
 use std::fs::File;
 
-use regex::Regex;
 use pbr::{ProgressBar, Units};
+use regex::Regex;
+use getopts::Options;
 
-fn main() -> std::io::Result<()> {
+fn print_usage(program: &str, opts: Options) {
+    let msg = format!("Usage: {} -b BOT -p PACKAGE1[,PACKAGE2,...] [options]", program);
+    print!("{}", opts.usage(&msg));
+}
+
+struct IRCRequest {
+    server: String,
+    channel: String,
+    bot: String,
+    package: String
+}
+
+fn main() {
     let args: Vec<String> = env::args().collect();
-    if args.len() != 3 {
-        println!("Invalid parameter count.");
-        println!("Usage: ircdl <bot_name> <package_number>");
-        process::exit(1);
+    let program = args[0].clone();
+    let mut opts = Options::new();
+    opts.reqopt("b", "bot", "IRC Bot name", "NAME")
+        .reqopt("p", "package", "DCC package number(s), separated with comma", "NUMBER")
+        .optopt("n", "network", "IRC server and port", "DOMAIN:PORT")
+        .optopt("c", "channel", "IRC channel to log in", "CHANNEL")
+        .optflag("h", "help", "print this help menu");
+
+    let matches = match opts.parse(&args[1..]) {
+        Ok(m) => { m }
+        Err(error) => { panic!(error.to_string()) }
+    };
+
+    if matches.opt_present("h") {
+        print_usage(&program, opts);
+        return;
     }
-    let bot_name = args[1].clone();
-    let package_number = args[2].clone();
+
+    let default_network = "irc.rizon.net:6667";
+    let default_channel = "nibl";
+    let package_numbers = matches.opt_str("p").expect("Package number(s) must be specified.");
+
+    for package_number in package_numbers.split(",") {
+        let request = IRCRequest {
+            server: matches.opt_str("n").unwrap_or(default_network.to_string()),
+            channel: matches.opt_str("c").unwrap_or(default_channel.to_string()),
+            bot: matches.opt_str("b").unwrap(),
+            package: package_number.replace("#", "").to_owned(),
+        };
+        connect_and_download(request);
+    }
+
+}
+
+fn connect_and_download(request: IRCRequest) {
     let dcc_send_regex = Regex::new(r#"DCC SEND "?(.*)"? (\d+) (\d+) (\d+)"#).unwrap();
-
-    let mut stream = TcpStream::connect("irc.rizon.net:6667")?;
-    let mut has_joined = false;
-    let mut download_finished = false;
-
-    stream.write("NICK randomRustacean\r\n".as_bytes())?;
-    stream.write("USER randomRustacean 0 * randomRustacean\r\n".as_bytes())?;
-
+    let ping_regex = Regex::new(r#"PING :\d+"#).unwrap();
+    let join_regex = Regex::new(r#"JOIN :#.*"#).unwrap();
     let handle = thread::spawn(move || {
+        let mut stream = TcpStream::connect(request.server).unwrap();
+        let mut has_joined = false;
+        let mut keep_irc_alive = true;
+
+        stream.write("NICK randomRustacean\r\n".as_bytes()).unwrap();
+        stream.write("USER randomRustacean 0 * randomRustacean\r\n".as_bytes()).unwrap();
+
         let mut message_builder = String::new();
         let mut buffer = [0; 4];
-        while !download_finished {
+        while keep_irc_alive {
             while !message_builder.contains("\n")  {
                 let count = stream.read(&mut buffer[..]).unwrap();
                 message_builder.push_str(from_utf8(&buffer[..count]).unwrap_or_default());
@@ -40,15 +83,18 @@ fn main() -> std::io::Result<()> {
             let message = message_builder.get(..endline_offset).unwrap().to_owned();
             message_builder.replace_range(..endline_offset, "");
 
-            if message.contains("PING") {
+            if ping_regex.is_match(&message) {
                 let pong = message.replace("PING", "PONG");
                 stream.write(pong.as_bytes()).unwrap();
                 if !has_joined {
-                    stream.write("JOIN #NIBL\r\n".as_bytes()).unwrap();
-                    let xdcc_send_cmd = format!("PRIVMSG {} :xdcc send #{}\r\n", bot_name, package_number);
+                    let xdcc_send_cmd = format!("PRIVMSG {} :xdcc send #{}\r\n", request.bot, request.package);
                     stream.write(xdcc_send_cmd.as_bytes()).unwrap();
-                    has_joined = true;
                 }
+            }
+            if join_regex.is_match(&message) {
+                let channel_join_cmd = format!("JOIN #{}\r\n", request.channel);
+                stream.write(channel_join_cmd.as_bytes()).unwrap();
+                has_joined = true;
             }
             if dcc_send_regex.is_match(&message) {
                 let captures = dcc_send_regex.captures(&message).unwrap();
@@ -56,25 +102,25 @@ fn main() -> std::io::Result<()> {
                 let ip = IpAddr::V4(Ipv4Addr::from(ip_number));
                 let size = captures[4].parse::<usize>().unwrap();
 
-                stream.shutdown(Shutdown::Both).unwrap();
                 download(&captures[1], &ip, &captures[3], size).unwrap();
-                download_finished = true;
+                stream.write("QUIT :job done\r\n".as_bytes()).unwrap();
+                stream.shutdown(Shutdown::Both).unwrap();
+                keep_irc_alive = false;
             }
         }
     });
 
     handle.join().unwrap();
-    Ok(())
 }
 
 fn download(filename: &str, ip: &IpAddr, port: &str, total_size: usize) -> std::result::Result<(), std::io::Error> {
-    println!("Will download {} from {}:{}", filename, ip, port);
     let mut file = File::create(filename)?;
     let mut stream = TcpStream::connect(format!("{}:{}", ip, port))?;
     let mut buffer = [0; 4096];
     let mut progress: usize = 0;
     let mut progress_bar = ProgressBar::new(total_size as u64);
     progress_bar.set_units(Units::Bytes);
+    progress_bar.message(&format!("{}: ", filename));
 
     while progress < total_size {
         let count = stream.read(&mut buffer[..])?;
@@ -82,7 +128,8 @@ fn download(filename: &str, ip: &IpAddr, port: &str, total_size: usize) -> std::
         progress += count;
         progress_bar.set(progress as u64);
     }
-    println!("End of download");
+    progress_bar.finish_println("");
     stream.shutdown(Shutdown::Both)?;
-    file.flush()
+    file.flush()?;
+    Ok(())
 }

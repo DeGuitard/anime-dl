@@ -1,8 +1,9 @@
 [package]
-name = "idearust"
+name = "ircdl"
 version = "0.1.0"
 authors = ["Vianney Dupoy de Guitard <vianney@n4v1.com>"]
 edition = "2018"
 
 [dependencies]
 regex = "1"
+pbr = "1.0.1"

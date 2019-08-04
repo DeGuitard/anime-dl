@@ -1,5 +1,5 @@
 [package]
-name = "ircdl"
+name = "anime-dl"
 version = "0.1.0"
 authors = ["Vianney Dupoy de Guitard <vianney@n4v1.com>"]
 edition = "2018"

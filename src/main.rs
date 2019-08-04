@@ -8,9 +8,16 @@ use std::io::{Write, Read};
 use std::str::from_utf8;
 use std::fs::File;
 
-use pbr::{ProgressBar, Units};
+use getopts::{Matches, Options};
+use lazy_static::lazy_static;
+use pbr::{ProgressBar, Units, MultiBar, Pipe};
 use regex::Regex;
-use getopts::Options;
+
+lazy_static! {
+    static ref DCC_SEND_REGEX: Regex = Regex::new(r#"DCC SEND "?(.*)"? (\d+) (\d+) (\d+)"#).unwrap();
+    static ref PING_REGEX: Regex = Regex::new(r#"PING :\d+"#).unwrap();
+    static ref JOIN_REGEX: Regex = Regex::new(r#"JOIN :#.*"#).unwrap();
+}
 
 fn print_usage(program: &str, opts: Options) {
     let msg = format!("Usage: {} -b BOT -p PACKAGE1[,PACKAGE2,...] [options]", program);
@@ -21,7 +28,14 @@ struct IRCRequest {
     server: String,
     channel: String,
     bot: String,
-    package: String
+    packages: Vec<String>
+}
+
+struct DCCSend {
+    filename: String,
+    ip: IpAddr,
+    port: String,
+    file_size: usize
 }
 
 fn main() {
@@ -44,91 +58,104 @@ fn main() {
         return;
     }
 
+    let request = parse_args(&matches);
+    connect_and_download(request);
+}
+
+fn parse_args(args: &Matches) -> IRCRequest {
     let default_network = "irc.rizon.net:6667";
     let default_channel = "nibl";
-    let package_numbers = matches.opt_str("p").expect("Package number(s) must be specified.");
+    let package_numbers = args.opt_str("p").expect("Package number(s) must be specified.");
 
-    for package_number in package_numbers.split(",") {
-        let request = IRCRequest {
-            server: matches.opt_str("n").unwrap_or(default_network.to_string()),
-            channel: matches.opt_str("c").unwrap_or(default_channel.to_string()),
-            bot: matches.opt_str("b").unwrap(),
-            package: package_number.replace("#", "").to_owned(),
-        };
-        connect_and_download(request);
+    IRCRequest {
+        server: args.opt_str("n").unwrap_or(default_network.to_string()),
+        channel: args.opt_str("c").unwrap_or(default_channel.to_string()),
+        bot: args.opt_str("b").unwrap(),
+        packages: package_numbers.split(",").map(String::from).collect::<Vec<_>>()
     }
-
 }
 
 fn connect_and_download(request: IRCRequest) {
-    let dcc_send_regex = Regex::new(r#"DCC SEND "?(.*)"? (\d+) (\d+) (\d+)"#).unwrap();
-    let ping_regex = Regex::new(r#"PING :\d+"#).unwrap();
-    let join_regex = Regex::new(r#"JOIN :#.*"#).unwrap();
-    let handle = thread::spawn(move || {
-        let mut stream = TcpStream::connect(request.server).unwrap();
-        let mut has_joined = false;
-        let mut keep_irc_alive = true;
+    let mut download_handles = Vec::new();
+    let mut stream = TcpStream::connect(request.server).unwrap();
+    let mut has_joined = false;
+    let mut multi_bar = MultiBar::new();
 
-        stream.write("NICK randomRustacean\r\n".as_bytes()).unwrap();
-        stream.write("USER randomRustacean 0 * randomRustacean\r\n".as_bytes()).unwrap();
+    stream.write("NICK randomRustacean\r\n".as_bytes()).unwrap();
+    stream.write("USER randomRustacean 0 * randomRustacean\r\n".as_bytes()).unwrap();
 
-        let mut message_builder = String::new();
-        let mut buffer = [0; 4];
-        while keep_irc_alive {
-            while !message_builder.contains("\n")  {
-                let count = stream.read(&mut buffer[..]).unwrap();
-                message_builder.push_str(from_utf8(&buffer[..count]).unwrap_or_default());
-            }
-            let endline_offset = message_builder.find('\n').unwrap() + 1;
-            let message = message_builder.get(..endline_offset).unwrap().to_owned();
-            message_builder.replace_range(..endline_offset, "");
+    let mut message_builder = String::new();
+    while download_handles.len() < request.packages.len() {
+        let message = read_next_message(&mut stream, &mut message_builder);
 
-            if ping_regex.is_match(&message) {
-                let pong = message.replace("PING", "PONG");
-                stream.write(pong.as_bytes()).unwrap();
-                if !has_joined {
-                    let xdcc_send_cmd = format!("PRIVMSG {} :xdcc send #{}\r\n", request.bot, request.package);
-                    stream.write(xdcc_send_cmd.as_bytes()).unwrap();
-                }
-            }
-            if join_regex.is_match(&message) {
+        if PING_REGEX.is_match(&message) {
+            let pong = message.replace("PING", "PONG");
+            stream.write(pong.as_bytes()).unwrap();
+            if !has_joined {
                 let channel_join_cmd = format!("JOIN #{}\r\n", request.channel);
                 stream.write(channel_join_cmd.as_bytes()).unwrap();
                 has_joined = true;
             }
-            if dcc_send_regex.is_match(&message) {
-                let captures = dcc_send_regex.captures(&message).unwrap();
-                let ip_number = captures[2].parse::<u32>().unwrap();
-                let ip = IpAddr::V4(Ipv4Addr::from(ip_number));
-                let size = captures[4].parse::<usize>().unwrap();
-
-                download(&captures[1], &ip, &captures[3], size).unwrap();
-                stream.write("QUIT :job done\r\n".as_bytes()).unwrap();
-                stream.shutdown(Shutdown::Both).unwrap();
-                keep_irc_alive = false;
+        }
+        if JOIN_REGEX.is_match(&message) {
+            for package in &request.packages {
+                let xdcc_send_cmd = format!("PRIVMSG {} :xdcc send #{}\r\n", request.bot, package);
+                stream.write(xdcc_send_cmd.as_bytes()).unwrap();
             }
         }
-    });
-
-    handle.join().unwrap();
+        if DCC_SEND_REGEX.is_match(&message) {
+            let request = parse_dcc_send(&message);
+            let mut progress_bar = multi_bar.create_bar(request.file_size as u64);
+            let handle = thread::spawn(move || {
+                download_file(request, &mut progress_bar).unwrap();
+            });
+            download_handles.push(handle);
+        }
+    }
+    stream.write("QUIT :my job is done here!\r\n".as_bytes()).unwrap();
+    stream.shutdown(Shutdown::Both).unwrap();
+    multi_bar.listen();
+    download_handles.into_iter().for_each(|handle| handle.join().unwrap());
 }
 
-fn download(filename: &str, ip: &IpAddr, port: &str, total_size: usize) -> std::result::Result<(), std::io::Error> {
-    let mut file = File::create(filename)?;
-    let mut stream = TcpStream::connect(format!("{}:{}", ip, port))?;
+fn read_next_message(stream: &mut TcpStream, message_builder: &mut String) -> String {
+    let mut buffer = [0; 4];
+    while !message_builder.contains("\n") {
+        let count = stream.read(&mut buffer[..]).unwrap();
+        message_builder.push_str(from_utf8(&buffer[..count]).unwrap_or_default());
+    }
+    let endline_offset = message_builder.find('\n').unwrap() + 1;
+    let message = message_builder.get(..endline_offset).unwrap().to_owned();
+    message_builder.replace_range(..endline_offset, "");
+    message
+}
+
+fn parse_dcc_send(message: &String) -> DCCSend {
+    let captures = DCC_SEND_REGEX.captures(&message).unwrap();
+    let ip_number = captures[2].parse::<u32>().unwrap();
+    DCCSend {
+        filename: captures[1].to_string(),
+        ip: IpAddr::V4(Ipv4Addr::from(ip_number)),
+        port: captures[3].to_string(),
+        file_size: captures[4].parse::<usize>().unwrap()
+    }
+}
+
+fn download_file(request: DCCSend, progress_bar: &mut ProgressBar<Pipe>) -> std::result::Result<(), std::io::Error> {
+    let mut file = File::create(&request.filename)?;
+    let mut stream = TcpStream::connect(format!("{}:{}", request.ip, request.port))?;
     let mut buffer = [0; 4096];
     let mut progress: usize = 0;
-    let mut progress_bar = ProgressBar::new(total_size as u64);
     progress_bar.set_units(Units::Bytes);
-    progress_bar.message(&format!("{}: ", filename));
+    progress_bar.message(&format!("{}: ", &request.filename));
 
-    while progress < total_size {
+    while progress < request.file_size {
         let count = stream.read(&mut buffer[..])?;
         file.write(&mut buffer[..count])?;
         progress += count;
         progress_bar.set(progress as u64);
     }
-    progress_bar.finish_println("");
+    progress_bar.finish();
     stream.shutdown(Shutdown::Both)?;
     file.flush()?;
     Ok(())

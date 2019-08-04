@@ -27,8 +27,9 @@ fn print_usage(program: &str, opts: Options) {
 struct IRCRequest {
     server: String,
     channel: String,
+    nickname: String,
     bot: String,
-    packages: Vec<String>
+    packages: Vec<String>,
 }
 
 struct DCCSend {
@@ -44,7 +45,8 @@ fn main() {
     let mut opts = Options::new();
     opts.reqopt("b", "bot", "IRC Bot name", "NAME")
         .reqopt("p", "package", "DCC package number(s), separated with comma", "NUMBER")
-        .optopt("n", "network", "IRC server and port", "DOMAIN:PORT")
+        .optopt("s", "server", "IRC server and port", "DOMAIN:PORT")
+        .optopt("n", "nickname", "Nickname to use", "NICK")
         .optopt("c", "channel", "IRC channel to log in", "CHANNEL")
         .optflag("h", "help", "print this help menu");
 
@@ -63,13 +65,15 @@ fn main() {
 }
 
 fn parse_args(args: &Matches) -> IRCRequest {
-    let default_network = "irc.rizon.net:6667";
+    let default_server = "irc.rizon.net:6667";
     let default_channel = "nibl";
+    let default_nickname = "randomRustacean";
     let package_numbers = args.opt_str("p").expect("Package number(s) must be specified.");
 
     IRCRequest {
-        server: args.opt_str("n").unwrap_or(default_network.to_string()),
+        server: args.opt_str("s").unwrap_or(default_server.to_string()),
         channel: args.opt_str("c").unwrap_or(default_channel.to_string()),
+        nickname: args.opt_str("n").unwrap_or(default_nickname.to_string()),
         bot: args.opt_str("b").unwrap(),
         packages: package_numbers.split(",").map(String::from).collect::<Vec<_>>()
     }
@@ -81,8 +85,8 @@ fn connect_and_download(request: IRCRequest) {
     let mut has_joined = false;
     let mut multi_bar = MultiBar::new();
 
-    stream.write("NICK randomRustacean\r\n".as_bytes()).unwrap();
-    stream.write("USER randomRustacean 0 * randomRustacean\r\n".as_bytes()).unwrap();
+    stream.write(format!("NICK {}\r\n", request.nickname).as_bytes()).unwrap();
+    stream.write(format!("USER {} 0 * {}\r\n", request.nickname, request.nickname).as_bytes()).unwrap();
 
     let mut message_builder = String::new();
     while download_handles.len() < request.packages.len() {

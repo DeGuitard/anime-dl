@@ -2,7 +2,7 @@ extern crate getopts;
 extern crate pbr;
 extern crate regex;
 
-use std::{env, thread};
+use std::{env, thread, process};
 use std::net::{TcpStream, IpAddr, Ipv4Addr, Shutdown};
 use std::io::{Write, Read};
 use std::str::from_utf8;
@@ -50,15 +50,21 @@ fn main() {
         .optopt("c", "channel", "IRC channel to log in", "CHANNEL")
         .optflag("h", "help", "print this help menu");
 
-    let matches = match opts.parse(&args[1..]) {
-        Ok(m) => { m }
-        Err(error) => { panic!(error.to_string()) }
-    };
-
-    if matches.opt_present("h") {
+    // Unfortunately, cannot use getopts to check for a single optional flag
+    // https://github.com/rust-lang-nursery/getopts/issues/46
+    if args.contains(&"-h".to_string()) || args.contains(&"--help".to_string()) {
         print_usage(&program, opts);
         return;
     }
+
+    let matches = match opts.parse(&args[1..]) {
+        Ok(m) => { m }
+        Err(error) => { 
+            eprintln!("{}.", error);
+            eprintln!("{}", opts.short_usage(&program));
+            process::exit(1);
+        }
+    };
 
     let request = parse_args(&matches);
     connect_and_download(request);

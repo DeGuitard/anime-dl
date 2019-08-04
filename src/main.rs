@@ -81,16 +81,13 @@ fn parse_args(args: &Matches) -> IRCRequest {
 
 fn connect_and_download(request: IRCRequest) {
     let mut download_handles = Vec::new();
-    let mut stream = TcpStream::connect(request.server).unwrap();
     let mut has_joined = false;
     let mut multi_bar = MultiBar::new();
+    let mut stream = log_in(&request).unwrap();
 
-    stream.write(format!("NICK {}\r\n", request.nickname).as_bytes()).unwrap();
-    stream.write(format!("USER {} 0 * {}\r\n", request.nickname, request.nickname).as_bytes()).unwrap();
-
-    let mut message_builder = String::new();
+    let mut message_buffer = String::new();
     while download_handles.len() < request.packages.len() {
-        let message = read_next_message(&mut stream, &mut message_builder);
+        let message = read_next_message(&mut stream, &mut message_buffer).unwrap();
 
         if PING_REGEX.is_match(&message) {
             let pong = message.replace("PING", "PONG");
@@ -122,16 +119,23 @@ fn connect_and_download(request: IRCRequest) {
     download_handles.into_iter().for_each(|handle| handle.join().unwrap());
 }
 
-fn read_next_message(stream: &mut TcpStream, message_builder: &mut String) -> String {
+fn log_in(request: &IRCRequest) -> Result<TcpStream, std::io::Error> {
+    let mut stream = TcpStream::connect(&request.server)?;
+    stream.write(format!("NICK {}\r\n", request.nickname).as_bytes())?;
+    stream.write(format!("USER {} 0 * {}\r\n", request.nickname, request.nickname).as_bytes())?;
+    Ok(stream)
+}
+
+fn read_next_message(stream: &mut TcpStream, message_builder: &mut String) -> Result<String, std::io::Error> {
     let mut buffer = [0; 4];
     while !message_builder.contains("\n") {
-        let count = stream.read(&mut buffer[..]).unwrap();
+        let count = stream.read(&mut buffer[..])?;
         message_builder.push_str(from_utf8(&buffer[..count]).unwrap_or_default());
     }
     let endline_offset = message_builder.find('\n').unwrap() + 1;
-    let message = message_builder.get(..endline_offset).unwrap().to_owned();
+    let message = message_builder.get(..endline_offset).unwrap().to_string();
     message_builder.replace_range(..endline_offset, "");
-    message
+    Ok(message)
 }
 
 fn parse_dcc_send(message: &String) -> DCCSend {
